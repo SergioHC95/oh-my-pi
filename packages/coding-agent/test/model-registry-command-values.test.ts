@@ -3,9 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { streamSimple } from "@oh-my-pi/pi-ai";
-import { withAuth } from "@oh-my-pi/pi-ai/auth-retry";
 import type { Api, Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
-import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { invalidateAllCommandConfigs, resolveConfigValue } from "@oh-my-pi/pi-coding-agent/config/resolve-config-value";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -63,18 +61,24 @@ function okChatCompletionStream(): Response {
 	});
 }
 
-/**
- * Fetch that records each request's credential headers, 401s until BOTH the
- * bearer and the tenant header carry their refreshed values, then streams a
- * successful completion.
- */
-function refreshGateFetch(seen: Array<{ auth?: string; tenant?: string }>): FetchImpl {
+/** Rotate the files when the gateway rejects the selected credential. */
+function refreshGateFetch(
+	rotations: ReadonlyArray<[file: string, value: string]>,
+	seen: Array<{ auth?: string; tenant?: string }>,
+): FetchImpl {
+	let challenged = false;
 	return async (_url, init) => {
 		const headers = (init?.headers ?? {}) as Record<string, string>;
-		const auth = headers.Authorization;
-		const tenant = headers["x-tenant-token"];
-		seen.push({ auth, tenant });
-		if (auth !== "Bearer fresh-bearer" || tenant !== "fresh-tenant") {
+		seen.push({ auth: headers.Authorization, tenant: headers["x-tenant-token"] });
+		if (!challenged) {
+			challenged = true;
+			for (const [file, value] of rotations) fs.writeFileSync(file, value);
+			return new Response(JSON.stringify({ error: { message: "invalid api key", type: "authentication_error" } }), {
+				status: 401,
+				headers: { "Content-Type": "application/json" },
+			});
+		}
+		if (headers.Authorization !== "Bearer fresh-bearer" || headers["x-tenant-token"] !== "fresh-tenant") {
 			return new Response(JSON.stringify({ error: { message: "invalid api key", type: "authentication_error" } }), {
 				status: 401,
 				headers: { "Content-Type": "application/json" },
@@ -200,12 +204,10 @@ describe("ModelRegistry command-resolved models.yml values", () => {
 		expect(await Bun.file(counterFile).text()).toBe("");
 	});
 
-	test("401 reruns a command-backed API key and updates live auth headers", async () => {
+	test("rotating a command-backed API key reaches the next request without a 401", async () => {
 		const tokenFile = path.join(tempDir, "token.txt");
-		const counterFile = path.join(tempDir, "counter.txt");
-		fs.writeFileSync(tokenFile, "stale-key");
-		fs.writeFileSync(counterFile, "");
-		const command = trackedTokenCommand(tokenFile, counterFile);
+		fs.writeFileSync(tokenFile, "token-a");
+		const command = stdoutFileCommand(tokenFile);
 
 		fs.writeFileSync(
 			modelsPath,
@@ -225,31 +227,35 @@ describe("ModelRegistry command-resolved models.yml values", () => {
 		const registry = new ModelRegistry(authStorage, modelsPath);
 		const model = registry.find("custom-proxy", "custom-model");
 		if (!model) throw new Error("Expected custom model");
-		expect(await registry.getApiKey(model)).toBe("stale-key");
-		fs.writeFileSync(tokenFile, "fresh-key");
+		expect(await registry.getApiKey(model)).toBe("token-a");
+		expect((await registry.resolveModelHeaders(model))?.Authorization).toBe("Bearer token-a");
+		fs.writeFileSync(tokenFile, "token-b");
 
-		const attemptedKeys: string[] = [];
-		const result = await withAuth(registry.resolver(model), async key => {
-			attemptedKeys.push(key);
-			if (key === "stale-key") {
-				throw Object.assign(new Error("401 authentication_error"), { status: 401 });
-			}
-			if (key === "fresh-key") return "ok";
-			throw new Error(`Unexpected API key: ${key}`);
+		const seen: Array<{ auth?: string }> = [];
+		const context: Context = { systemPrompt: ["s"], messages: [{ role: "user", content: "hi", timestamp: 0 }] };
+		const streamHandle = streamSimple(model, context, {
+			apiKey: registry.resolver(model),
+			fetch: async (_url, init) => {
+				const headers = (init?.headers ?? {}) as Record<string, string>;
+				seen.push({ auth: headers.Authorization });
+				return okChatCompletionStream();
+			},
+			maxTokens: 16,
 		});
+		for await (const _event of streamHandle) {
+			// drain
+		}
+		const result = await streamHandle.result();
 
-		expect(result).toBe("ok");
-		expect(attemptedKeys).toEqual(["stale-key", "fresh-key"]);
-		expect(fs.readFileSync(counterFile, "utf8")).toBe("11");
-		expect((await registry.resolveModelHeaders(model))?.Authorization).toBe("Bearer fresh-key");
+		expect(result.stopReason).not.toBe("error");
+		expect(seen).toEqual([{ auth: "Bearer token-b" }]);
+		expect((await registry.resolveModelHeaders(model))?.Authorization).toBe("Bearer token-b");
 	});
 
-	test("failed 401 refresh discards the rejected command-backed key", async () => {
+	test("failed authentication refresh does not reuse the rejected key or delay recovery", async () => {
 		const tokenFile = path.join(tempDir, "token.txt");
-		const counterFile = path.join(tempDir, "counter.txt");
-		fs.writeFileSync(tokenFile, "stale-key");
-		fs.writeFileSync(counterFile, "");
-		const command = trackedTokenCommand(tokenFile, counterFile);
+		fs.writeFileSync(tokenFile, "stale-bearer");
+		const command = stdoutFileCommand(tokenFile);
 
 		fs.writeFileSync(
 			modelsPath,
@@ -269,66 +275,42 @@ describe("ModelRegistry command-resolved models.yml values", () => {
 		const registry = new ModelRegistry(authStorage, modelsPath);
 		const model = registry.find("custom-proxy", "custom-model");
 		if (!model) throw new Error("Expected custom model");
-		expect(await registry.getApiKey(model)).toBe("stale-key");
-		fs.writeFileSync(tokenFile, "FAIL");
-
-		const refreshed = await registry.resolver(model)({
-			lastChance: false,
-			error: Object.assign(new Error("401 authentication_error"), { status: 401 }),
-			previousKey: "stale-key",
+		const seen: Array<{ auth?: string; tenant?: string }> = [];
+		const context: Context = { systemPrompt: ["s"], messages: [{ role: "user", content: "hi", timestamp: 0 }] };
+		const streamHandle = streamSimple(model, context, {
+			apiKey: registry.resolver(model),
+			fetch: refreshGateFetch([[tokenFile, ""]], seen),
+			maxTokens: 16,
 		});
+		for await (const _event of streamHandle) {
+			// drain
+		}
+		expect((await streamHandle.result()).stopReason).toBe("error");
+		expect(seen.map(request => request.auth)).toEqual(["Bearer stale-bearer"]);
 
-		expect(refreshed).toBeUndefined();
-		expect(fs.readFileSync(counterFile, "utf8")).toBe("11");
-		expect(await registry.getApiKey(model)).toBeUndefined();
-		expect((await registry.resolveModelHeaders(model))?.Authorization).toBeUndefined();
+		fs.writeFileSync(tokenFile, "recovered-key");
+		expect(await registry.getApiKey(model)).toBe("recovered-key");
+		expect((await registry.resolveModelHeaders(model))?.Authorization).toBe("Bearer recovered-key");
 	});
 
-	test("command resolution backs off after failed executions", async () => {
+	test("generic command resolution keeps its cache and backs off after failed executions", async () => {
 		const counterFile = path.join(tempDir, "counter.txt");
 		fs.writeFileSync(counterFile, "");
 
 		// Command increments a counter and then fails (exit 1).
 		const trackingCommand = failedTrackingCommand(counterFile);
+		const config = `!${trackingCommand}`;
 
-		fs.writeFileSync(
-			modelsPath,
-			JSON.stringify({
-				providers: {
-					"custom-proxy": {
-						baseUrl: "https://custom-proxy.example.com/v1",
-						api: "openai-completions",
-						apiKey: `!${trackingCommand}`,
-					},
-				},
-			}),
-		);
-
-		// Catalog construction records the command without executing it.
-		const registry = new ModelRegistry(authStorage, modelsPath);
-		expect(fs.readFileSync(counterFile, "utf8")).toBe("");
-
-		const dummyModel: Model<Api> = buildModel({
-			id: "foo",
-			name: "foo",
-			api: "openai-completions",
-			provider: "custom-proxy",
-			baseUrl: "a",
-			reasoning: false,
-			input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 4096,
-			maxTokens: 1024,
-		});
-
-		// Trigger the fallback resolver which also calls resolveConfigValue.
-		await registry.getApiKey(dummyModel);
-
-		// Another call to ensure it hits cache multiple times.
-		await registry.getApiKey(dummyModel);
-
-		// The command should have only run once.
+		// The generic (non-credential) policy caches completed results and
+		// failure backoff: repeated resolves execute the command once.
+		expect(await resolveConfigValue(config)).toBeUndefined();
+		expect(await resolveConfigValue(config)).toBeUndefined();
 		expect(fs.readFileSync(counterFile, "utf8")).toBe("1");
+
+		// A rotating credential must not be blocked by that generic backoff.
+		expect(await resolveConfigValue(config, false)).toBeUndefined();
+		expect(await resolveConfigValue(config, false)).toBeUndefined();
+		expect(fs.readFileSync(counterFile, "utf8")).toBe("3");
 	});
 
 	test("401 refreshes a command-backed provider header and retries with the fresh value", async () => {
@@ -354,20 +336,19 @@ describe("ModelRegistry command-resolved models.yml values", () => {
 		const registry = new ModelRegistry(authStorage, modelsPath);
 		const model = registry.find("custom-proxy", "custom-model");
 		if (!model) throw new Error("Expected custom model");
-		// Materializing the request headers caches the stale command result, as
-		// the first live request would. The rotation below is only observed on
-		// retry if the 401 path invalidates the command cache and re-runs it.
-		expect((await registry.resolveModelHeaders(model))?.["x-tenant-token"]).toBe("stale-tenant");
-		expect(await registry.getApiKey(model)).toBe("stale-bearer");
-		// The credential backend rotates both tokens out-of-band.
-		fs.writeFileSync(bearerFile, "fresh-bearer");
-		fs.writeFileSync(tenantFile, "fresh-tenant");
-
+		// The request leaves with the credentials the files held at selection
+		// time; the gateway below rejects them and rotates the files out-of-band.
 		const seen: Array<{ auth?: string; tenant?: string }> = [];
 		const context: Context = { systemPrompt: ["s"], messages: [{ role: "user", content: "hi", timestamp: 0 }] };
 		const streamHandle = streamSimple(model, context, {
 			apiKey: registry.resolver(model),
-			fetch: refreshGateFetch(seen),
+			fetch: refreshGateFetch(
+				[
+					[bearerFile, "fresh-bearer"],
+					[tenantFile, "fresh-tenant"],
+				],
+				seen,
+			),
 			maxTokens: 16,
 		});
 		for await (const _event of streamHandle) {
@@ -410,23 +391,23 @@ describe("ModelRegistry command-resolved models.yml values", () => {
 		const registry = new ModelRegistry(authStorage, modelsPath);
 		const model = registry.find("custom-proxy", "custom-model");
 		if (!model) throw new Error("Expected custom model");
-		expect((await registry.resolveModelHeaders(model))?.["x-tenant-token"]).toBe("stale-tenant");
-		expect(await registry.getApiKey(model)).toBe("stale-bearer");
-		fs.writeFileSync(bearerFile, "fresh-bearer");
-		fs.writeFileSync(tenantFile, "fresh-tenant");
-
 		const seen: Array<{ auth?: string; tenant?: string }> = [];
 		const context: Context = { systemPrompt: ["s"], messages: [{ role: "user", content: "hi", timestamp: 0 }] };
 		const streamHandle = streamSimple(model, context, {
 			apiKey: registry.resolver(model),
-			fetch: refreshGateFetch(seen),
+			fetch: refreshGateFetch(
+				[
+					[bearerFile, "fresh-bearer"],
+					[tenantFile, "fresh-tenant"],
+				],
+				seen,
+			),
 			maxTokens: 16,
 		});
 		for await (const _event of streamHandle) {
 			// drain
 		}
 		const result = await streamHandle.result();
-
 		expect(result.stopReason).not.toBe("error");
 		expect(seen).toEqual([
 			{ auth: "Bearer stale-bearer", tenant: "stale-tenant" },
@@ -459,23 +440,23 @@ describe("ModelRegistry command-resolved models.yml values", () => {
 		const registry = new ModelRegistry(authStorage, modelsPath);
 		const model = registry.find("custom-proxy", "custom-model");
 		if (!model) throw new Error("Expected custom model");
-		expect((await registry.resolveModelHeaders(model))?.["x-tenant-token"]).toBe("stale-tenant");
-		expect(await registry.getApiKey(model)).toBe("stale-bearer");
-		fs.writeFileSync(bearerFile, "fresh-bearer");
-		fs.writeFileSync(tenantFile, "fresh-tenant");
-
 		const seen: Array<{ auth?: string; tenant?: string }> = [];
 		const context: Context = { systemPrompt: ["s"], messages: [{ role: "user", content: "hi", timestamp: 0 }] };
 		const streamHandle = streamSimple(model, context, {
 			apiKey: registry.resolver(model),
-			fetch: refreshGateFetch(seen),
+			fetch: refreshGateFetch(
+				[
+					[bearerFile, "fresh-bearer"],
+					[tenantFile, "fresh-tenant"],
+				],
+				seen,
+			),
 			maxTokens: 16,
 		});
 		for await (const _event of streamHandle) {
 			// drain
 		}
 		const result = await streamHandle.result();
-
 		expect(result.stopReason).not.toBe("error");
 		expect(seen).toEqual([
 			{ auth: "Bearer stale-bearer", tenant: "stale-tenant" },
@@ -513,12 +494,11 @@ describe("ModelRegistry command-resolved models.yml values", () => {
 		expect(fs.readFileSync(counterFile, "utf8")).toBe("1");
 	});
 
-	test("refresh('online') re-runs a command-backed API key after the backend rotates", async () => {
-		const tokenFile = path.join(tempDir, "token.txt");
+	test("refreshProvider('online') without refreshCommandCredentials leaves command-backed headers cached", async () => {
+		const headerFile = path.join(tempDir, "header.txt");
 		const counterFile = path.join(tempDir, "counter.txt");
-		fs.writeFileSync(tokenFile, "stale-key");
+		fs.writeFileSync(headerFile, "stale-header");
 		fs.writeFileSync(counterFile, "");
-		const command = trackedTokenCommand(tokenFile, counterFile);
 
 		fs.writeFileSync(
 			modelsPath,
@@ -527,8 +507,8 @@ describe("ModelRegistry command-resolved models.yml values", () => {
 					"custom-proxy": {
 						baseUrl: "https://custom-proxy.example.com/v1",
 						api: "openai-completions",
-						apiKey: `!${command}`,
-						authHeader: true,
+						apiKey: "literal-key",
+						headers: { "x-tenant-token": `!${trackedTokenCommand(headerFile, counterFile)}` },
 						models: [{ id: "custom-model", name: "Custom Model" }],
 					},
 				},
@@ -538,103 +518,23 @@ describe("ModelRegistry command-resolved models.yml values", () => {
 		const registry = new ModelRegistry(authStorage, modelsPath);
 		const model = registry.find("custom-proxy", "custom-model");
 		if (!model) throw new Error("Expected custom model");
-		expect(await registry.getApiKey(model)).toBe("stale-key");
+		expect((await registry.resolveModelHeaders(model))?.["x-tenant-token"]).toBe("stale-header");
 		expect(fs.readFileSync(counterFile, "utf8")).toBe("1");
 
-		fs.writeFileSync(tokenFile, "fresh-key");
-		// Background / policy reloads must not spawn credential helpers.
-		await registry.refresh("online-if-uncached");
-		await registry.refresh("offline");
-		// Passive online discovery (unscoped /models hub open) must not either.
-		await registry.refresh("online");
-		expect(await registry.getApiKey(model)).toBe("stale-key");
-		expect(fs.readFileSync(counterFile, "utf8")).toBe("1");
-
-		// User-facing recovery: `omp models refresh`, TUI F5.
-		await registry.refresh("online", { refreshCommandCredentials: true });
-		expect(await registry.getApiKey(model)).toBe("fresh-key");
-		expect(fs.readFileSync(counterFile, "utf8")).toBe("11");
-		const refreshed = registry.find("custom-proxy", "custom-model");
-		expect(refreshed && (await registry.resolveModelHeaders(refreshed))?.Authorization).toBe("Bearer fresh-key");
-	});
-
-	test("refresh('online') retries a command that was negative-cached after a failure", async () => {
-		const tokenFile = path.join(tempDir, "token.txt");
-		const counterFile = path.join(tempDir, "counter.txt");
-		fs.writeFileSync(tokenFile, "FAIL");
-		fs.writeFileSync(counterFile, "");
-		const command = trackedTokenCommand(tokenFile, counterFile);
-
-		fs.writeFileSync(
-			modelsPath,
-			JSON.stringify({
-				providers: {
-					"custom-proxy": {
-						baseUrl: "https://custom-proxy.example.com/v1",
-						api: "openai-completions",
-						apiKey: `!${command}`,
-						authHeader: true,
-						models: [{ id: "custom-model", name: "Custom Model" }],
-					},
-				},
-			}),
-		);
-
-		const registry = new ModelRegistry(authStorage, modelsPath);
-		const model = registry.find("custom-proxy", "custom-model");
-		if (!model) throw new Error("Expected custom model");
-		expect(await registry.getApiKey(model)).toBeUndefined();
-		expect(fs.readFileSync(counterFile, "utf8")).toBe("1");
-
-		// Helper is healthy again, but the 30s failure backoff would still block
-		// getApiKey until process restart — unless online refresh clears it.
-		fs.writeFileSync(tokenFile, "recovered-key");
-		expect(await registry.getApiKey(model)).toBeUndefined();
-		expect(fs.readFileSync(counterFile, "utf8")).toBe("1");
-
-		await registry.refresh("online", { refreshCommandCredentials: true });
-		expect(await registry.getApiKey(model)).toBe("recovered-key");
-		expect(fs.readFileSync(counterFile, "utf8")).toBe("11");
-	});
-
-	test("refreshProvider('online') without refreshCommandCredentials leaves command cache intact", async () => {
-		const tokenFile = path.join(tempDir, "token.txt");
-		const counterFile = path.join(tempDir, "counter.txt");
-		fs.writeFileSync(tokenFile, "stale-key");
-		fs.writeFileSync(counterFile, "");
-
-		fs.writeFileSync(
-			modelsPath,
-			JSON.stringify({
-				providers: {
-					"custom-proxy": {
-						baseUrl: "https://custom-proxy.example.com/v1",
-						api: "openai-completions",
-						apiKey: `!${trackedTokenCommand(tokenFile, counterFile)}`,
-						models: [{ id: "custom-model", name: "Custom Model" }],
-					},
-				},
-			}),
-		);
-
-		const registry = new ModelRegistry(authStorage, modelsPath);
-		expect(await registry.getApiKeyForProvider("custom-proxy")).toBe("stale-key");
-		expect(fs.readFileSync(counterFile, "utf8")).toBe("1");
-
-		fs.writeFileSync(tokenFile, "fresh-key");
-		// Hover / auto-refresh: live catalog, same cached credential.
+		fs.writeFileSync(headerFile, "fresh-header");
+		// Hover / auto-refresh: live catalog, same cached header.
 		await registry.refreshProvider("custom-proxy", "online");
-		expect(await registry.getApiKeyForProvider("custom-proxy")).toBe("stale-key");
+		expect((await registry.resolveModelHeaders(model))?.["x-tenant-token"]).toBe("stale-header");
 		expect(fs.readFileSync(counterFile, "utf8")).toBe("1");
 	});
 
 	test("refreshProvider('online') invalidates only that provider's command cache", async () => {
-		const tokenA = path.join(tempDir, "token-a.txt");
-		const tokenB = path.join(tempDir, "token-b.txt");
+		const headerA = path.join(tempDir, "header-a.txt");
+		const headerB = path.join(tempDir, "header-b.txt");
 		const counterA = path.join(tempDir, "counter-a.txt");
 		const counterB = path.join(tempDir, "counter-b.txt");
-		fs.writeFileSync(tokenA, "a-stale");
-		fs.writeFileSync(tokenB, "b-stale");
+		fs.writeFileSync(headerA, "a-stale");
+		fs.writeFileSync(headerB, "b-stale");
 		fs.writeFileSync(counterA, "");
 		fs.writeFileSync(counterB, "");
 
@@ -645,13 +545,15 @@ describe("ModelRegistry command-resolved models.yml values", () => {
 					"proxy-a": {
 						baseUrl: "https://a.example.com/v1",
 						api: "openai-completions",
-						apiKey: `!${trackedTokenCommand(tokenA, counterA)}`,
+						apiKey: "literal-a",
+						headers: { "x-tenant-token": `!${trackedTokenCommand(headerA, counterA)}` },
 						models: [{ id: "model-a", name: "A" }],
 					},
 					"proxy-b": {
 						baseUrl: "https://b.example.com/v1",
 						api: "openai-completions",
-						apiKey: `!${trackedTokenCommand(tokenB, counterB)}`,
+						apiKey: "literal-b",
+						headers: { "x-tenant-token": `!${trackedTokenCommand(headerB, counterB)}` },
 						models: [{ id: "model-b", name: "B" }],
 					},
 				},
@@ -659,17 +561,22 @@ describe("ModelRegistry command-resolved models.yml values", () => {
 		);
 
 		const registry = new ModelRegistry(authStorage, modelsPath);
-		expect(await registry.getApiKeyForProvider("proxy-a")).toBe("a-stale");
-		expect(await registry.getApiKeyForProvider("proxy-b")).toBe("b-stale");
+		const modelA = registry.find("proxy-a", "model-a");
+		const modelB = registry.find("proxy-b", "model-b");
+		if (!modelA || !modelB) throw new Error("Expected proxy models");
+		expect((await registry.resolveModelHeaders(modelA))?.["x-tenant-token"]).toBe("a-stale");
+		expect((await registry.resolveModelHeaders(modelB))?.["x-tenant-token"]).toBe("b-stale");
 		expect(fs.readFileSync(counterA, "utf8")).toBe("1");
 		expect(fs.readFileSync(counterB, "utf8")).toBe("1");
 
-		fs.writeFileSync(tokenA, "a-fresh");
-		fs.writeFileSync(tokenB, "b-fresh");
+		fs.writeFileSync(headerA, "a-fresh");
+		fs.writeFileSync(headerB, "b-fresh");
 		await registry.refreshProvider("proxy-a", "online", { refreshCommandCredentials: true });
 
-		expect(await registry.getApiKeyForProvider("proxy-a")).toBe("a-fresh");
-		expect(await registry.getApiKeyForProvider("proxy-b")).toBe("b-stale");
+		const refreshedA = registry.find("proxy-a", "model-a");
+		const refreshedB = registry.find("proxy-b", "model-b");
+		expect(refreshedA && (await registry.resolveModelHeaders(refreshedA))?.["x-tenant-token"]).toBe("a-fresh");
+		expect(refreshedB && (await registry.resolveModelHeaders(refreshedB))?.["x-tenant-token"]).toBe("b-stale");
 		expect(fs.readFileSync(counterA, "utf8")).toBe("11");
 		expect(fs.readFileSync(counterB, "utf8")).toBe("1");
 	});
@@ -799,16 +706,17 @@ describe("ModelRegistry command-resolved models.yml values", () => {
 		await registry.refreshProvider("dyn-proxy", "online");
 		const model = registry.find("dyn-proxy", "dyn-model");
 		if (!model) throw new Error("Expected dynamic model");
-		expect((await registry.resolveModelHeaders(model))?.["x-tenant-token"]).toBe("stale-tenant");
-		expect(await registry.getApiKey(model)).toBe("stale-bearer");
-		fs.writeFileSync(bearerFile, "fresh-bearer");
-		fs.writeFileSync(tenantFile, "fresh-tenant");
-
 		const seen: Array<{ auth?: string; tenant?: string }> = [];
 		const context: Context = { systemPrompt: ["s"], messages: [{ role: "user", content: "hi", timestamp: 0 }] };
 		const streamHandle = streamSimple(model, context, {
 			apiKey: registry.resolver(model),
-			fetch: refreshGateFetch(seen),
+			fetch: refreshGateFetch(
+				[
+					[bearerFile, "fresh-bearer"],
+					[tenantFile, "fresh-tenant"],
+				],
+				seen,
+			),
 			maxTokens: 16,
 		});
 		for await (const _event of streamHandle) {
@@ -821,5 +729,36 @@ describe("ModelRegistry command-resolved models.yml values", () => {
 			{ auth: "Bearer stale-bearer", tenant: "stale-tenant" },
 			{ auth: "Bearer fresh-bearer", tenant: "fresh-tenant" },
 		]);
+	});
+
+	test("passive catalog refreshes do not execute credential commands", async () => {
+		const tokenFile = path.join(tempDir, "token.txt");
+		const counterFile = path.join(tempDir, "counter.txt");
+		fs.writeFileSync(tokenFile, "configured-key");
+		fs.writeFileSync(counterFile, "");
+		fs.writeFileSync(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					"custom-proxy": {
+						baseUrl: "https://custom-proxy.example.com/v1",
+						api: "openai-completions",
+						apiKey: `!${trackedTokenCommand(tokenFile, counterFile)}`,
+						models: [{ id: "custom-model", name: "Custom Model" }],
+					},
+				},
+			}),
+		);
+		const registry = new ModelRegistry(authStorage, modelsPath);
+		const model = registry.find("custom-proxy", "custom-model");
+		if (!model) throw new Error("Expected custom model");
+		expect(await registry.getApiKey(model)).toBe("configured-key");
+		const before = fs.readFileSync(counterFile, "utf8");
+
+		await registry.refresh("online-if-uncached");
+		await registry.refresh("offline");
+		await registry.refresh("online");
+
+		expect(fs.readFileSync(counterFile, "utf8")).toBe(before);
 	});
 });

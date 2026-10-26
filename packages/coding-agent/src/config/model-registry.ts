@@ -543,7 +543,8 @@ export class ModelRegistry {
 		this.#modelsConfigFile = ModelsConfigFile.relocate(modelsPath ?? path.join(getAgentDir(), "models.yml"));
 		this.#cacheDbPath =
 			options?.cacheDbPath ?? (modelsPath ? path.join(path.dirname(modelsPath), "models.db") : undefined);
-		this.authStorage.keys.setResolver(resolveConfigValue);
+		// Model credentials can rotate independently of this process.
+		this.authStorage.keys.setResolver(value => resolveConfigValue(value, false));
 		// Load config and cache-backed layers synchronously in the constructor.
 		this.#loadModels();
 	}

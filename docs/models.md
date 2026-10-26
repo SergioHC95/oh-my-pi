@@ -293,7 +293,9 @@ providers:
       X-Team-Key: "!bw get password omp-team-key"
 ```
 
-Successful command outputs are cached for the process lifetime, and concurrent requests share an in-flight execution. Failures back off for 30 seconds. Refresh callers that request `refreshCommandCredentials` (including the model hub's explicit refresh) and 401 credential recovery invalidate the relevant cached API keys and headers; an ordinary catalog refresh does not. Runtime API-key overrides, including `--api-key`, take precedence over configured credentials.
+Command-backed `apiKey` values and their derived bearer headers are re-read for each credential lookup. Concurrent lookups share an in-flight execution, but neither completed output nor failure is retained, so rotation and recovery are observed on the next lookup. Runtime API-key overrides, including `--api-key`, still take precedence over configured credentials.
+
+Other command-backed values, including explicitly configured headers, keep their process-lifetime output cache and 30-second failure backoff. Explicit `refreshCommandCredentials` and 401 credential recovery invalidate the relevant pending executions and cached headers; an ordinary catalog refresh does not.
 
 ## Merge and override order
 

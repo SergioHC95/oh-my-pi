@@ -5,6 +5,7 @@ const COMMAND_FAILURE_RETRY_MS = 30_000;
 const commandResultCache = new Map<string, string>();
 const commandFailureRetryAt = new Map<string, number>();
 const commandInFlight = new Map<string, Promise<string | undefined>>();
+const commandInFlightUncached = new Map<string, Promise<string | undefined>>();
 const commandGeneration = new Map<string, number>();
 
 /** Materialize request headers for models and discovery without property-access side effects. */
@@ -34,6 +35,7 @@ export function invalidateCommandConfig(valueConfig: string | undefined): void {
 	commandResultCache.delete(command);
 	commandFailureRetryAt.delete(command);
 	commandInFlight.delete(command);
+	commandInFlightUncached.delete(command);
 	commandGeneration.set(command, (commandGeneration.get(command) ?? 0) + 1);
 }
 
@@ -43,33 +45,39 @@ export function invalidateAllCommandConfigs(): void {
 		...commandResultCache.keys(),
 		...commandFailureRetryAt.keys(),
 		...commandInFlight.keys(),
+		...commandInFlightUncached.keys(),
 	])) {
 		commandGeneration.set(command, (commandGeneration.get(command) ?? 0) + 1);
 	}
 	commandResultCache.clear();
 	commandFailureRetryAt.clear();
 	commandInFlight.clear();
+	commandInFlightUncached.clear();
 }
 
-async function executeCommand(valueConfig: string): Promise<string | undefined> {
+async function executeCommand(valueConfig: string, cacheResult: boolean): Promise<string | undefined> {
 	const command = commandKey(valueConfig);
 
-	const cached = commandResultCache.get(command);
-	if (cached !== undefined) return cached;
-	const retryAt = commandFailureRetryAt.get(command);
-	if (retryAt !== undefined && Date.now() < retryAt) return undefined;
+	if (cacheResult) {
+		const cached = commandResultCache.get(command);
+		if (cached !== undefined) return cached;
+		const retryAt = commandFailureRetryAt.get(command);
+		if (retryAt !== undefined && Date.now() < retryAt) return undefined;
+	}
 
-	const existing = commandInFlight.get(command);
+	// Keep cached configuration flights separate from live credential reads.
+	const inflight = cacheResult ? commandInFlight : commandInFlightUncached;
+	const existing = inflight.get(command);
 	if (existing) return await existing;
 
-	const generation = commandGeneration.get(command) ?? 0;
+	const generation = cacheResult ? (commandGeneration.get(command) ?? 0) : 0;
 	const promise: Promise<string | undefined> = (async () => {
 		const cwd = getProjectDir();
 		if (!(await directoryIsEnterable(cwd))) return undefined;
 		return await runShellCommand(command, 10_000, cwd);
 	})()
 		.then(result => {
-			if ((commandGeneration.get(command) ?? 0) !== generation) return result;
+			if (!cacheResult || (commandGeneration.get(command) ?? 0) !== generation) return result;
 			if (result === undefined) {
 				commandFailureRetryAt.set(command, Date.now() + COMMAND_FAILURE_RETRY_MS);
 			} else {
@@ -84,25 +92,26 @@ async function executeCommand(valueConfig: string): Promise<string | undefined> 
 					? (error as NodeJS.ErrnoException).code
 					: "unknown";
 			logger.warn("config: !command value resolution failed", { code });
-			if ((commandGeneration.get(command) ?? 0) === generation) {
+			if (cacheResult && (commandGeneration.get(command) ?? 0) === generation) {
 				commandFailureRetryAt.set(command, Date.now() + COMMAND_FAILURE_RETRY_MS);
 			}
 			return undefined;
 		})
 		.finally(() => {
-			if (commandInFlight.get(command) === promise) commandInFlight.delete(command);
+			if (inflight.get(command) === promise) inflight.delete(command);
 		});
 
-	commandInFlight.set(command, promise);
+	inflight.set(command, promise);
 	return await promise;
 }
 
 /**
  * Resolve a configuration value. Command values execute asynchronously and
  * successful stdout is cached; environment-backed and literal values stay live.
+ * Pass false for live credentials; only concurrent command reads are shared.
  */
-export async function resolveConfigValue(valueConfig: string): Promise<string | undefined> {
-	if (isCommandConfigValue(valueConfig)) return await executeCommand(valueConfig);
+export async function resolveConfigValue(valueConfig: string, cacheResult = true): Promise<string | undefined> {
+	if (isCommandConfigValue(valueConfig)) return await executeCommand(valueConfig, cacheResult);
 	const envValue = $envExact(valueConfig);
 	return envValue || valueConfig;
 }
@@ -192,7 +201,7 @@ export function createConfigHeaderResolver(
 		}
 		if (options?.authHeader && options.apiKeyConfig) {
 			const keyConfig = options.apiKeyConfig;
-			const apiKey = await untilAborted(signal, () => resolveConfigValue(keyConfig));
+			const apiKey = await untilAborted(signal, () => resolveConfigValue(keyConfig, false));
 			if (apiKey) {
 				resolved.Authorization = `Bearer ${apiKey}`;
 				hasResolved = true;
@@ -205,5 +214,4 @@ export function createConfigHeaderResolver(
 /** Clear all command state. Exported for focused resolver tests. */
 export function clearConfigValueCache(): void {
 	invalidateAllCommandConfigs();
-	commandInFlight.clear();
 }

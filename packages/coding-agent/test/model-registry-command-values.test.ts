@@ -21,15 +21,9 @@ function stdoutCommand(value: string): string {
 
 function trackedTokenCommand(tokenFile: string, counterFile: string): string {
 	if (process.platform !== "win32") {
-		return `IFS= read -r token < ${shellQuote(tokenFile)}; printf 1 >> ${shellQuote(counterFile)}; [ "$token" = FAIL ] && exit 1; printf %s "$token"`;
+		return `IFS= read -r token < ${shellQuote(tokenFile)}; printf 1 >> ${shellQuote(counterFile)}; printf %s "$token"`;
 	}
-	const script = `const fs=require("node:fs");fs.appendFileSync(${JSON.stringify(counterFile)}, "1");const token=fs.readFileSync(${JSON.stringify(tokenFile)}, "utf8").trim();if(token==="FAIL")process.exit(1);process.stdout.write(token);`;
-	return `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`;
-}
-
-function failedTrackingCommand(counterFile: string): string {
-	if (process.platform !== "win32") return `printf 1 >> ${shellQuote(counterFile)}; exit 1`;
-	const script = `const fs=require("node:fs");fs.appendFileSync(${JSON.stringify(counterFile)}, "1");process.exit(1);`;
+	const script = `const fs=require("node:fs");fs.appendFileSync(${JSON.stringify(counterFile)}, "1");const token=fs.readFileSync(${JSON.stringify(tokenFile)}, "utf8").trim();process.stdout.write(token);`;
 	return `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`;
 }
 
@@ -293,24 +287,19 @@ describe("ModelRegistry command-resolved models.yml values", () => {
 		expect((await registry.resolveModelHeaders(model))?.Authorization).toBe("Bearer recovered-key");
 	});
 
-	test("generic command resolution keeps its cache and backs off after failed executions", async () => {
-		const counterFile = path.join(tempDir, "counter.txt");
-		fs.writeFileSync(counterFile, "");
-
-		// Command increments a counter and then fails (exit 1).
-		const trackingCommand = failedTrackingCommand(counterFile);
-		const config = `!${trackingCommand}`;
-
-		// The generic (non-credential) policy caches completed results and
-		// failure backoff: repeated resolves execute the command once.
+	test("generic failure backoff does not block live credential reads", async () => {
+		const tokenFile = path.join(tempDir, "token.txt");
+		const config = `!${stdoutFileCommand(tokenFile)}`;
+		fs.writeFileSync(tokenFile, "");
 		expect(await resolveConfigValue(config)).toBeUndefined();
-		expect(await resolveConfigValue(config)).toBeUndefined();
-		expect(fs.readFileSync(counterFile, "utf8")).toBe("1");
 
-		// A rotating credential must not be blocked by that generic backoff.
-		expect(await resolveConfigValue(config, false)).toBeUndefined();
-		expect(await resolveConfigValue(config, false)).toBeUndefined();
-		expect(fs.readFileSync(counterFile, "utf8")).toBe("3");
+		fs.writeFileSync(tokenFile, "available-key");
+		expect(await resolveConfigValue(config)).toBeUndefined();
+		expect(await resolveConfigValue(config, false)).toBe("available-key");
+
+		fs.writeFileSync(tokenFile, "rotated-key");
+		expect(await resolveConfigValue(config, false)).toBe("rotated-key");
+		expect(await resolveConfigValue(config)).toBeUndefined();
 	});
 
 	test("401 refreshes a command-backed provider header and retries with the fresh value", async () => {
